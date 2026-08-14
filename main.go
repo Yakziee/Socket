@@ -5,18 +5,29 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/pem"
+	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/creack/pty"
 )
+
+type Server struct {
+	Conf       *tls.Config
+	listenAddr string
+	ln         net.Listener
+}
 
 type Peer struct {
 	conn net.Conn
@@ -24,74 +35,165 @@ type Peer struct {
 }
 
 type App struct {
-	listenAddr string
-	ln         net.Listener
-
 	mu    sync.Mutex
 	peers []*Peer
 }
 
-func certificate() (*tls.Config, error) {
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func run() error {
+	var arg string
+	if len(os.Args) > 1 {
+		arg = os.Args[1]
+	}
+
+	addr, err := parseAddress(arg)
+	if err != nil {
+		return err
+	}
+
+	server, err := newServer()
+	if err != nil {
+		return err
+	}
+
+	app := newApp()
+	server.listenAddr = addr
+
+	if err := server.listen(app); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// initialization functions
+
+func newServer() (*Server, error) {
+	conf, err := createCertificate()
+	if err != nil {
+		return nil, err
+	}
+
+	return &Server{Conf: conf}, nil
+}
+
+func newPeer(app *App, conn net.Conn) *Peer { return &Peer{conn: conn, app: app} }
+
+func newApp() *App { return &App{} }
+
+// helpers/general functions
+
+func parseAddress(arg string) (string, error) {
+	const defaultAddress = ":7777"
+
+	arg = strings.TrimSpace(arg)
+
+	if arg == "" {
+		return defaultAddress, nil
+	}
+
+	if !strings.Contains(arg, ":") {
+		arg = ":" + arg
+	}
+
+	_, port, err := net.SplitHostPort(arg)
+	if err != nil {
+		return "", fmt.Errorf("Invalid address %q %w", arg, err)
+	}
+
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", fmt.Errorf("Invalid port: %q", port)
+	}
+
+	return arg, nil
+}
+
+func getString() (string, error) {
+	b := make([]byte, 10)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+
+	return base64.RawStdEncoding.EncodeToString(b), nil
+}
+
+func createCertificate() (*tls.Config, error) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, err
 	}
 
-	tempForCert := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+	ca, err := getString()
+	if err != nil {
+		return nil, err
 	}
 
-	bytes, err := x509.CreateCertificate(rand.Reader, &tempForCert, &tempForCert, &privateKey.PublicKey, privateKey)
+	certificate := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: ca,
+		},
+		NotBefore:   time.Now(),
+		NotAfter:    time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	bytes, err := x509.CreateCertificate(rand.Reader, &certificate, &certificate, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: bytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+
+	if err := os.WriteFile("cert.crt", certPEM, 0644); err != nil {
+		return nil, err
+	}
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, err
 	}
 
 	return &tls.Config{
-		Certificates: []tls.Certificate{
-			{
-				Certificate: [][]byte{bytes},
-				PrivateKey:  privateKey,
-			},
-		},
+		Certificates: []tls.Certificate{cert},
 	}, nil
 }
 
-func newApp(listenAddr string) *App {
-	return &App{
-		listenAddr: listenAddr,
-	}
-}
+// Server methods
 
-func address() string {
-	if len(os.Args) > 1 && os.Args[1] != "" {
-		argument := os.Args[1]
-
-		if strings.Contains(argument, ":") {
-			return argument
-		}
-		return ":" + argument
-	}
-
-	return ":7777"
-}
-
-func (a *App) start() error {
-	conf, err := certificate()
+func (s *Server) listen(a *App) error {
+	ln, err := tls.Listen("tcp", s.listenAddr, s.Conf)
 	if err != nil {
 		return err
 	}
-
-	ln, err := tls.Listen("tcp", a.listenAddr, conf)
-	if err != nil {
-		return err
-	}
-
-	a.ln = ln
 	defer ln.Close()
 
-	return a.accept()
+	s.ln = ln
+
+	return a.accept(ln)
+}
+
+// App methods
+
+func (a *App) accept(ln net.Listener) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			continue
+		}
+
+		peer := a.addNewPeer(conn)
+
+		go peer.handleConn()
+	}
 }
 
 func (a *App) addNewPeer(conn net.Conn) *Peer {
@@ -99,6 +201,7 @@ func (a *App) addNewPeer(conn net.Conn) *Peer {
 	a.mu.Lock()
 	a.peers = append(a.peers, peer)
 	a.mu.Unlock()
+
 	return peer
 }
 
@@ -114,7 +217,9 @@ func (a *App) removePeer(p *Peer) {
 	}
 }
 
-func (p *Peer) handle() error {
+// Peer methods
+
+func (p *Peer) handleConn() error {
 	defer p.app.removePeer(p)
 
 	cmd := exec.Command("bash")
@@ -126,12 +231,12 @@ func (p *Peer) handle() error {
 	}
 
 	defer func() {
-		_ = p.conn.Close()
-		_ = pty.Close()
+		p.conn.Close()
+		pty.Close()
 		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+			cmd.Process.Kill()
 		}
-		_ = cmd.Wait()
+		cmd.Wait()
 	}()
 
 	errCh := make(chan error, 2)
@@ -147,53 +252,4 @@ func (p *Peer) handle() error {
 	}()
 
 	return <-errCh
-}
-
-func (a *App) accept() error {
-	for {
-		conn, err := a.ln.Accept()
-		if err != nil {
-			continue
-		}
-
-		peer := a.addNewPeer(conn)
-
-		go peer.handle()
-
-	}
-}
-
-func newPeer(app *App, conn net.Conn) *Peer {
-	return &Peer{
-		conn: conn,
-		app:  app,
-	}
-}
-
-func makeDaemon() error {
-	if os.Getenv("socket") == "1" {
-		return nil
-	}
-
-	cmd := exec.Command(os.Args[0], os.Args[1:]...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	cmd.Env = append(os.Environ(), "socket=1")
-
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
-
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	os.Exit(0)
-
-	return nil
-}
-
-func main() {
-	makeDaemon()
-	addr := address()
-	app := newApp(addr)
-	if err := app.start(); err != nil {
-		panic(err)
-	}
 }
