@@ -74,7 +74,7 @@ func run() error {
 // initialization functions
 
 func newServer() (*Server, error) {
-	conf, err := createCertificate()
+	conf, err := createCertificates()
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +114,16 @@ func parseAddress(arg string) (string, error) {
 	return arg, nil
 }
 
+func send(conn net.Conn, pty *os.File) error {
+	_, err := io.Copy(pty, conn)
+	return err
+}
+
+func receive(conn net.Conn, pty *os.File) error {
+	_, err := io.Copy(conn, pty)
+	return err
+}
+
 func getString() (string, error) {
 	b := make([]byte, 10)
 	if _, err := rand.Read(b); err != nil {
@@ -123,47 +133,94 @@ func getString() (string, error) {
 	return base64.RawStdEncoding.EncodeToString(b), nil
 }
 
-func createCertificate() (*tls.Config, error) {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, err
-	}
-
-	ca, err := getString()
+func createCertificates() (*tls.Config, error) {
+	caKey, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
 		return nil, err
 	}
 
 	certificate := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			CommonName: ca,
-		},
-		NotBefore:   time.Now(),
-		NotAfter:    time.Now().Add(365 * 24 * time.Hour),
-		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "CA"},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
 	}
 
-	bytes, err := x509.CreateCertificate(rand.Reader, &certificate, &certificate, &privateKey.PublicKey, privateKey)
+	bytes, err := x509.CreateCertificate(rand.Reader, &certificate, &certificate, &caKey.PublicKey, caKey)
 	if err != nil {
 		return nil, err
 	}
 
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: bytes})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
-
-	if err := os.WriteFile("cert.crt", certPEM, 0644); err != nil {
-		return nil, err
-	}
-
-	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	caCertificate, err := x509.ParseCertificate(bytes)
 	if err != nil {
 		return nil, err
 	}
+
+	serverKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+
+	serverCertificate := x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "server"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	sBytes, err := x509.CreateCertificate(rand.Reader, &serverCertificate, caCertificate, &serverKey.PublicKey, caKey)
+	if err != nil {
+		return nil, err
+	}
+
+	sCertificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: sBytes})
+	sKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(serverKey)})
+	serverCert, err := tls.X509KeyPair(sCertificatePEM, sKeyPEM)
+	if err != nil {
+		return nil, err
+	}
+
+	clientKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, err
+	}
+
+	clientCertificate := x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: "c"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(10, 0, 0),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+
+	cBytes, err := x509.CreateCertificate(rand.Reader, &clientCertificate, caCertificate, &clientKey.PublicKey, caKey)
+	if err != nil {
+		return nil, err
+	}
+
+	clientCertPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cBytes})
+	cKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(clientKey)})
+
+	os.WriteFile("client.crt", clientCertPEM, 0644)
+	os.WriteFile("client.key", cKeyPEM, 0600)
+
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: bytes})
+	os.WriteFile("ca.crt", caPEM, 0644)
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caPEM)
 
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    caCertPool,
+		MinVersion:   tls.VersionTLS12,
 	}, nil
 }
 
@@ -242,13 +299,11 @@ func (p *Peer) handleConn() error {
 	errCh := make(chan error, 2)
 
 	go func() {
-		_, err := io.Copy(pty, p.conn)
-		errCh <- err
+		errCh <- send(p.conn, pty)
 	}()
 
 	go func() {
-		_, err := io.Copy(p.conn, pty)
-		errCh <- err
+		errCh <- receive(p.conn, pty)
 	}()
 
 	return <-errCh
