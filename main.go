@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -114,6 +113,7 @@ func parseAddress(arg string) (string, error) {
 	return arg, nil
 }
 
+<<<<<<< Updated upstream
 func getString() (string, error) {
 	b := make([]byte, 10)
 	if _, err := rand.Read(b); err != nil {
@@ -130,6 +130,10 @@ func createCertificate() (*tls.Config, error) {
 	}
 
 	ca, err := getString()
+=======
+func createCertificates() (*tls.Config, error) {
+	caKey, err := rsa.GenerateKey(rand.Reader, 4096)
+>>>>>>> Stashed changes
 	if err != nil {
 		return nil, err
 	}
@@ -242,12 +246,20 @@ func (p *Peer) handleConn() error {
 	errCh := make(chan error, 2)
 
 	go func() {
+<<<<<<< Updated upstream
 		_, err := io.Copy(pty, p.conn)
+=======
+		_, err := io.Copy(p.conn, pty)
+>>>>>>> Stashed changes
 		errCh <- err
 	}()
 
 	go func() {
+<<<<<<< Updated upstream
 		_, err := io.Copy(p.conn, pty)
+=======
+		_, err := io.Copy(pty, p.conn)
+>>>>>>> Stashed changes
 		errCh <- err
 	}()
 
